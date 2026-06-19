@@ -1,0 +1,34 @@
+[package]
+name = "otp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Generate TOTP one-time passwords from a local secrets file and copy them to the clipboard. Fast Rust CLI."
+authors = ["printemps.tokyo <develop@printemps.tokyo>"]
+repository = "https://github.com/printemps-tokyo/otp"
+homepage = "https://github.com/printemps-tokyo/otp"
+readme = "README.md"
+keywords = ["totp", "otp", "2fa", "authenticator", "cli"]
+categories = ["command-line-utilities", "authentication"]
+
+[[bin]]
+name = "otp"
+path = "src/main.rs"
+
+[lib]
+name = "otp"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+data-encoding = "2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

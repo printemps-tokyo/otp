@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a problem
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Expected vs. actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / environment
+      placeholder: "v0.1.0 / macOS / rustc 1.96"
+    validations:
+      required: false
