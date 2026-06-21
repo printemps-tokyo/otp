@@ -39,7 +39,7 @@ cargo install --git https://github.com/printemps-tokyo/otp
 cargo install --path .
 ```
 
-Prebuilt binaries are attached to each [release](https://github.com/printemps-tokyo/otp/releases).
+Prebuilt binaries will be attached to each [release](https://github.com/printemps-tokyo/otp/releases) once a version is tagged.
 
 ## Usage
 
