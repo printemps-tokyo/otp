@@ -105,6 +105,11 @@ fn unix_now() -> Result<u64> {
 }
 
 fn cmd_generate(service: &str, opts: &GenerateArgs) -> Result<()> {
+    // An empty query would substring-match every entry; reject it up front
+    // instead of reporting the whole store as "ambiguous".
+    if service.trim().is_empty() {
+        bail!("service name required");
+    }
     let path = secrets_path()?;
     let entries = parse_store(&read_store(&path)?);
     // Resolve the name: exact match first, then unique prefix, then unique

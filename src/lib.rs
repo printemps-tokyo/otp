@@ -261,7 +261,7 @@ pub enum Resolution<'a> {
     /// Several entries matched equally well; the caller must not guess.
     Ambiguous(Vec<&'a str>),
     /// Nothing matched; carries the closest names for a "did you mean" hint
-    /// (possibly empty). Ranked by prefix, then substring, then edit distance.
+    /// (possibly empty). Ranked by edit distance, ties broken by name.
     NotFound(Vec<&'a str>),
 }
 
