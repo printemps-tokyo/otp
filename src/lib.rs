@@ -246,6 +246,92 @@ pub fn find_entry<'a>(entries: &'a [Entry], service: &str) -> Option<&'a Entry> 
     entries.iter().find(|e| e.service == service)
 }
 
+/// Maximum edit distance for a name to appear in "did you mean" suggestions.
+const SUGGESTION_MAX_DISTANCE: usize = 3;
+
+/// Maximum number of "did you mean" suggestions to return.
+const SUGGESTION_LIMIT: usize = 3;
+
+/// Result of resolving a user-supplied service query against the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution<'a> {
+    /// Exactly one entry matched: an exact name, a unique case-insensitive
+    /// prefix, or a unique case-insensitive substring (in that order).
+    Unique(&'a Entry),
+    /// Several entries matched equally well; the caller must not guess.
+    Ambiguous(Vec<&'a str>),
+    /// Nothing matched; carries the closest names for a "did you mean" hint
+    /// (possibly empty). Ranked by prefix, then substring, then edit distance.
+    NotFound(Vec<&'a str>),
+}
+
+/// Resolve a service query to an entry. An exact name always wins (an entry
+/// literally named "githu" beats prefix-expanding "githu" to "github"). Then a
+/// unique case-insensitive prefix match, then a unique case-insensitive
+/// substring match. Multiple equally good matches are reported as ambiguous
+/// rather than guessed at.
+pub fn resolve_entry<'a>(entries: &'a [Entry], query: &str) -> Resolution<'a> {
+    if let Some(entry) = find_entry(entries, query) {
+        return Resolution::Unique(entry);
+    }
+
+    let q = query.to_ascii_lowercase();
+    let collect = |pred: fn(&str, &str) -> bool| -> Vec<&'a Entry> {
+        entries
+            .iter()
+            .filter(|e| pred(&e.service.to_ascii_lowercase(), &q))
+            .collect()
+    };
+    let by_prefix = collect(|name, q| name.starts_with(q));
+    let by_substring = collect(|name, q| name.contains(q));
+    for matches in [by_prefix, by_substring] {
+        match matches.as_slice() {
+            [] => continue,
+            [single] => return Resolution::Unique(single),
+            many => {
+                return Resolution::Ambiguous(many.iter().map(|e| e.service.as_str()).collect())
+            }
+        }
+    }
+
+    // No prefix or substring match: suggest the closest names by edit distance.
+    let mut scored: Vec<(usize, &str)> = entries
+        .iter()
+        .map(|e| {
+            (
+                edit_distance(&q, &e.service.to_ascii_lowercase()),
+                e.service.as_str(),
+            )
+        })
+        .filter(|(distance, _)| *distance <= SUGGESTION_MAX_DISTANCE)
+        .collect();
+    scored.sort();
+    Resolution::NotFound(
+        scored
+            .into_iter()
+            .take(SUGGESTION_LIMIT)
+            .map(|(_, name)| name)
+            .collect(),
+    )
+}
+
+/// Levenshtein edit distance between two strings, over Unicode scalar values.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let substitution = prev[j] + usize::from(ca != cb);
+            curr[j + 1] = substitution.min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
 /// Validate a service name for `add`: non-empty, no colon or whitespace.
 pub fn validate_service_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -353,6 +439,72 @@ mod tests {
             "otpauth://totp/x?secret=JBSWY3DP"
         );
         assert!(find_entry(&entries, "missing").is_none());
+    }
+
+    fn store(names: &[&str]) -> Vec<Entry> {
+        names
+            .iter()
+            .map(|name| Entry {
+                service: name.to_string(),
+                value: "JBSWY3DP".to_string(),
+            })
+            .collect()
+    }
+
+    fn service_of(resolution: Resolution<'_>) -> String {
+        match resolution {
+            Resolution::Unique(entry) => entry.service.clone(),
+            other => panic!("expected a unique match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_entry_exact_match_beats_prefix_expansion() {
+        let entries = store(&["githu", "github"]);
+        assert_eq!(service_of(resolve_entry(&entries, "githu")), "githu");
+    }
+
+    #[test]
+    fn resolve_entry_unique_prefix_resolves_case_insensitively() {
+        let entries = store(&["github", "gitlab", "aws"]);
+        assert_eq!(service_of(resolve_entry(&entries, "gith")), "github");
+        assert_eq!(service_of(resolve_entry(&entries, "GITH")), "github");
+        assert_eq!(service_of(resolve_entry(&entries, "aws")), "aws");
+    }
+
+    #[test]
+    fn resolve_entry_ambiguous_prefix_lists_candidates() {
+        let entries = store(&["github", "gitlab", "aws"]);
+        assert_eq!(
+            resolve_entry(&entries, "git"),
+            Resolution::Ambiguous(vec!["github", "gitlab"])
+        );
+    }
+
+    #[test]
+    fn resolve_entry_falls_back_to_unique_substring() {
+        let entries = store(&["github", "gitlab", "aws"]);
+        assert_eq!(service_of(resolve_entry(&entries, "hub")), "github");
+        // Multiple substring matches are ambiguous, never guessed.
+        assert_eq!(
+            resolve_entry(&entries, "it"),
+            Resolution::Ambiguous(vec!["github", "gitlab"])
+        );
+    }
+
+    #[test]
+    fn resolve_entry_suggests_closest_names_when_nothing_matches() {
+        let entries = store(&["github", "gitlab", "aws"]);
+        // One typo away from "github": suggested, closest first.
+        assert_eq!(
+            resolve_entry(&entries, "guthub"),
+            Resolution::NotFound(vec!["github", "gitlab"])
+        );
+        // Nothing anywhere near: no suggestions, still not found.
+        assert_eq!(
+            resolve_entry(&entries, "zzzzzzzz"),
+            Resolution::NotFound(vec![])
+        );
     }
 
     #[test]

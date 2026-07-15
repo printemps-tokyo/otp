@@ -9,7 +9,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use otp::{
-    find_entry, parse_store, resolve_secret, seconds_remaining, totp_at, validate_service_name,
+    find_entry, parse_store, resolve_entry, resolve_secret, seconds_remaining, totp_at,
+    validate_service_name, Resolution,
 };
 
 /// Generate TOTP one-time passwords from a local secrets file.
@@ -106,11 +107,29 @@ fn unix_now() -> Result<u64> {
 fn cmd_generate(service: &str, opts: &GenerateArgs) -> Result<()> {
     let path = secrets_path()?;
     let entries = parse_store(&read_store(&path)?);
-    let entry = find_entry(&entries, service)
-        .ok_or_else(|| anyhow!("service {service:?} not found (see: otp ls)"))?;
+    // Resolve the name: exact match first, then unique prefix, then unique
+    // substring. Anything ambiguous is an error, so scripts never get a code
+    // for a service the user did not mean.
+    let entry = match resolve_entry(&entries, service) {
+        Resolution::Unique(entry) => entry,
+        Resolution::Ambiguous(candidates) => bail!(
+            "service {service:?} is ambiguous; candidates:\n  {}",
+            candidates.join("\n  ")
+        ),
+        Resolution::NotFound(suggestions) if suggestions.is_empty() => {
+            bail!("service {service:?} not found (see: otp ls)")
+        }
+        Resolution::NotFound(suggestions) => bail!(
+            "service {service:?} not found; did you mean:\n  {}",
+            suggestions.join("\n  ")
+        ),
+    };
+    if entry.service != service {
+        eprintln!("otp: matched service {}", entry.service);
+    }
 
     let params = resolve_secret(&entry.value)
-        .with_context(|| format!("invalid secret for service {service:?}"))?;
+        .with_context(|| format!("invalid secret for service {:?}", entry.service))?;
     let now = unix_now()?;
     let code = totp_at(&params, now);
     let remaining = seconds_remaining(&params, now);

@@ -56,6 +56,16 @@ otp ls                     # list services
 | `-q, --quiet` | Print only the code (no label) and do not copy. Handy for scripts |
 | `--no-copy` | Generate and print, but do not touch the clipboard |
 
+### Name matching
+
+You do not have to type the full service name. `otp gith` resolves to `github`
+when it is the only name with that prefix (case-insensitive); if no prefix
+matches, a unique substring match is tried (`otp hub` also finds `github`). An
+exact name always wins over expansion, and if several names match, `otp` lists
+the candidates and exits non-zero instead of guessing -- including in `--quiet`
+mode, so scripts never get a code for the wrong service. An unmatched name
+prints a "did you mean" list of the closest entries.
+
 ### Adding services
 
 ```bash
