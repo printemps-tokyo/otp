@@ -35,5 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85
+      # The version goes in `toolchain` on @master (the action's README), not
+      # in the ref: Dependabot would "update" a ref like @1.88 to the newest.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
       - run: cargo test --locked --all
