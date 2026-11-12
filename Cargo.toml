@@ -2,7 +2,7 @@
 name = "otp"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 description = "Generate TOTP one-time passwords from a local secrets file and copy them to the clipboard. Fast Rust CLI."
 authors = ["printemps.tokyo <develop@printemps.tokyo>"]

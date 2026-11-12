@@ -39,5 +39,5 @@ jobs:
       # in the ref: Dependabot would "update" a ref like @1.88 to the newest.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
       - run: cargo test --locked --all
