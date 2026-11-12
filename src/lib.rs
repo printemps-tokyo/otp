@@ -5,7 +5,7 @@
 //! Everything here is pure: the time and the secrets file are passed in by the
 //! caller, which keeps the code easy to test against the RFC test vectors.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
@@ -39,6 +39,9 @@ pub struct TotpParams {
     pub digits: u32,
     pub period: u64,
     pub algorithm: Algorithm,
+    /// For an HOTP (counter-based, RFC 4226) secret, the counter of the next
+    /// code; None for TOTP.
+    pub hotp_counter: Option<u64>,
 }
 
 impl TotpParams {
@@ -64,6 +67,7 @@ impl TotpParams {
             digits,
             period,
             algorithm,
+            hotp_counter: None,
         })
     }
 }
@@ -128,18 +132,24 @@ pub fn seconds_remaining(params: &TotpParams, unix_secs: u64) -> u64 {
     params.period - (unix_secs % params.period)
 }
 
-/// Parse an `otpauth://totp/...` URI into TOTP parameters. Missing query
-/// fields fall back to the standard defaults (SHA1, 6 digits, 30s period).
+/// Parse an `otpauth://totp/...` or `otpauth://hotp/...` URI. Missing query
+/// fields fall back to the standard defaults (SHA1, 6 digits, 30s period);
+/// an HOTP URI must carry its `counter`, as the Key URI Format requires.
 pub fn parse_otpauth(uri: &str) -> Result<TotpParams> {
-    let rest = uri
-        .strip_prefix("otpauth://totp/")
-        .ok_or_else(|| anyhow!("not a TOTP otpauth URI: {uri:?}"))?;
+    let (rest, is_hotp) = if let Some(r) = uri.strip_prefix("otpauth://totp/") {
+        (r, false)
+    } else if let Some(r) = uri.strip_prefix("otpauth://hotp/") {
+        (r, true)
+    } else {
+        bail!("not a TOTP or HOTP otpauth URI: {}", redact_uri(uri));
+    };
     let query = rest.split_once('?').map(|(_, q)| q).unwrap_or("");
 
     let mut secret: Option<String> = None;
     let mut digits: u32 = 6;
     let mut period: u64 = 30;
     let mut algorithm = Algorithm::Sha1;
+    let mut counter: Option<u64> = None;
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -160,12 +170,275 @@ pub fn parse_otpauth(uri: &str) -> Result<TotpParams> {
                     .map_err(|_| anyhow!("invalid period: {value:?}"))?
             }
             "algorithm" => algorithm = Algorithm::parse(&value)?,
+            "counter" => {
+                counter = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow!("invalid counter: {value:?}"))?,
+                )
+            }
             _ => {}
         }
     }
 
     let secret = secret.ok_or_else(|| anyhow!("otpauth URI is missing the secret parameter"))?;
-    TotpParams::from_base32(&secret, digits, period, algorithm)
+    let mut params = TotpParams::from_base32(&secret, digits, period, algorithm)?;
+    if is_hotp {
+        params.hotp_counter =
+            Some(counter.ok_or_else(|| anyhow!("an HOTP otpauth URI needs a counter parameter"))?);
+    }
+    Ok(params)
+}
+
+/// A URI shown in a message without its secret.
+fn redact_uri(uri: &str) -> String {
+    match uri.split_once('?') {
+        Some((head, _)) => format!("{head}?..."),
+        None => uri.to_string(),
+    }
+}
+
+/// The code for these parameters now: TOTP from the time, or HOTP from the
+/// stored counter (the caller advances the counter after using it).
+pub fn code_at(params: &TotpParams, unix_secs: u64) -> String {
+    match params.hotp_counter {
+        Some(counter) => {
+            let code = hotp(&params.key, counter, params.digits, params.algorithm);
+            format!("{code:0width$}", width = params.digits as usize)
+        }
+        None => totp_at(params, unix_secs),
+    }
+}
+
+/// An `otpauth://hotp/` URI for a bare base32 secret and a counter.
+pub fn hotp_uri(label: &str, secret: &str, counter: u64) -> String {
+    format!(
+        "otpauth://hotp/{}?secret={}&counter={counter}",
+        percent_encode(label),
+        secret.trim().replace(' ', "").to_ascii_uppercase()
+    )
+}
+
+/// The same otpauth URI with its `counter` parameter set to `counter`.
+pub fn set_counter(uri: &str, counter: u64) -> String {
+    let (head, query) = uri.split_once('?').unwrap_or((uri, ""));
+    let mut pairs: Vec<String> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.to_ascii_lowercase().starts_with("counter="))
+        .map(str::to_string)
+        .collect();
+    pairs.push(format!("counter={counter}"));
+    format!("{head}?{}", pairs.join("&"))
+}
+
+/// Percent-encode everything but unreserved characters (RFC 3986).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// One account found in an imported QR payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Imported {
+    /// The account part of the label (e.g. an e-mail address).
+    pub account: String,
+    pub issuer: String,
+    /// An otpauth URI carrying the secret and its parameters.
+    pub uri: String,
+}
+
+/// The accounts in a scanned QR payload: an `otpauth://` URI, or a Google
+/// Authenticator export (`otpauth-migration://offline?data=...`), which can
+/// hold several.
+pub fn import_payload(text: &str) -> Result<Vec<Imported>> {
+    let t = text.trim();
+    if t.starts_with("otpauth-migration://") {
+        return parse_migration(t);
+    }
+    if t.starts_with("otpauth://") {
+        parse_otpauth(t).context("the QR code holds an otpauth URI that is not valid")?;
+        let (head, query) = t.split_once('?').unwrap_or((t, ""));
+        let label = percent_decode(head.splitn(4, '/').nth(3).unwrap_or(""));
+        let (label_issuer, account) = match label.split_once(':') {
+            Some((i, a)) => (i.trim().to_string(), a.trim().to_string()),
+            None => (String::new(), label.trim().to_string()),
+        };
+        let issuer = query
+            .split('&')
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| k.eq_ignore_ascii_case("issuer"))
+            .map(|(_, v)| percent_decode(v))
+            .unwrap_or(label_issuer);
+        return Ok(vec![Imported {
+            account,
+            issuer,
+            uri: t.to_string(),
+        }]);
+    }
+    bail!("the QR code does not hold an otpauth:// or otpauth-migration:// payload");
+}
+
+/// Read a protobuf varint at `*at`.
+fn varint(buf: &[u8], at: &mut usize) -> Result<u64> {
+    let mut v: u64 = 0;
+    for shift in (0..64).step_by(7) {
+        let b = *buf
+            .get(*at)
+            .ok_or_else(|| anyhow!("export data is cut short"))?;
+        *at += 1;
+        v |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Ok(v);
+        }
+    }
+    bail!("export data has a varint that is too long")
+}
+
+/// A protobuf field value: a varint, or length-delimited bytes.
+enum Proto {
+    Varint(u64),
+    Bytes(Vec<u8>),
+}
+
+/// The fields of one protobuf message: (field number, value).
+fn proto_fields(buf: &[u8]) -> Result<Vec<(u64, Proto)>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < buf.len() {
+        let key = varint(buf, &mut at)?;
+        let (field, wire) = (key >> 3, key & 7);
+        match wire {
+            0 => out.push((field, Proto::Varint(varint(buf, &mut at)?))),
+            2 => {
+                let len = usize::try_from(varint(buf, &mut at)?)?;
+                let end = at
+                    .checked_add(len)
+                    .filter(|&e| e <= buf.len())
+                    .ok_or_else(|| anyhow!("export data is cut short"))?;
+                out.push((field, Proto::Bytes(buf[at..end].to_vec())));
+                at = end;
+            }
+            1 => at += 8,
+            5 => at += 4,
+            _ => bail!("export data uses an unknown protobuf wire type {wire}"),
+        }
+    }
+    Ok(out)
+}
+
+/// Decode a Google Authenticator export: base64 protobuf in `data`, as the
+/// widely used reconstruction of its schema describes (MigrationPayload with
+/// repeated OtpParameters: secret, name, issuer, algorithm, digits, type,
+/// counter).
+pub fn parse_migration(uri: &str) -> Result<Vec<Imported>> {
+    let query = uri
+        .strip_prefix("otpauth-migration://offline?")
+        .ok_or_else(|| anyhow!("not an otpauth-migration://offline URI"))?;
+    let data = query
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| *k == "data")
+        .map(|(_, v)| percent_decode(v).replace(' ', "+"))
+        .ok_or_else(|| anyhow!("the export URI has no data parameter"))?;
+    let bytes = data_encoding::BASE64
+        .decode(data.as_bytes())
+        .or_else(|_| data_encoding::BASE64_NOPAD.decode(data.trim_end_matches('=').as_bytes()))
+        .map_err(|_| anyhow!("the export data is not base64"))?;
+    let mut out = Vec::new();
+    for (field, value) in proto_fields(&bytes)? {
+        let (1, Proto::Bytes(msg)) = (field, value) else {
+            continue;
+        };
+        let mut secret = Vec::new();
+        let (mut name, mut issuer) = (String::new(), String::new());
+        let (mut algorithm, mut digits, mut kind, mut counter) = (0u64, 0u64, 0u64, 0u64);
+        for (f, v) in proto_fields(&msg)? {
+            match (f, v) {
+                (1, Proto::Bytes(b)) => secret = b,
+                (2, Proto::Bytes(b)) => name = String::from_utf8_lossy(&b).into_owned(),
+                (3, Proto::Bytes(b)) => issuer = String::from_utf8_lossy(&b).into_owned(),
+                (4, Proto::Varint(n)) => algorithm = n,
+                (5, Proto::Varint(n)) => digits = n,
+                (6, Proto::Varint(n)) => kind = n,
+                (7, Proto::Varint(n)) => counter = n,
+                _ => {}
+            }
+        }
+        if secret.is_empty() {
+            bail!("an exported account has no secret");
+        }
+        let algorithm = match algorithm {
+            0 | 1 => "SHA1",
+            2 => "SHA256",
+            3 => "SHA512",
+            _ => bail!("an exported account uses an algorithm otp does not support (MD5)"),
+        };
+        let digits = if digits == 2 { 8 } else { 6 };
+        // The name may already be "issuer:account".
+        let account = match name.split_once(':') {
+            Some((i, a)) if !issuer.is_empty() && i.trim() == issuer => a.trim().to_string(),
+            _ => name.clone(),
+        };
+        let label = if issuer.is_empty() {
+            account.clone()
+        } else {
+            format!("{issuer}:{account}")
+        };
+        let mut uri = format!(
+            "otpauth://{}/{}?secret={}&algorithm={algorithm}&digits={digits}",
+            if kind == 1 { "hotp" } else { "totp" },
+            percent_encode(&label),
+            data_encoding::BASE32_NOPAD.encode(&secret)
+        );
+        if !issuer.is_empty() {
+            uri.push_str(&format!("&issuer={}", percent_encode(&issuer)));
+        }
+        if kind == 1 {
+            uri.push_str(&format!("&counter={counter}"));
+        }
+        out.push(Imported {
+            account,
+            issuer,
+            uri,
+        });
+    }
+    if out.is_empty() {
+        bail!("the export holds no accounts");
+    }
+    Ok(out)
+}
+
+/// A service name for an imported account: the issuer (or else the account),
+/// lowercased, with whitespace and colons turned into dashes.
+pub fn suggest_service_name(item: &Imported) -> String {
+    let base = if item.issuer.trim().is_empty() {
+        &item.account
+    } else {
+        &item.issuer
+    };
+    let mut name = String::new();
+    for c in base.trim().chars() {
+        if c.is_whitespace() || c == ':' {
+            if !name.ends_with('-') {
+                name.push('-');
+            }
+        } else {
+            name.extend(c.to_lowercase());
+        }
+    }
+    let name = name.trim_matches('-').to_string();
+    if name.is_empty() {
+        "imported".to_string()
+    } else {
+        name
+    }
 }
 
 /// Resolve a stored secret value: either a bare base32 secret (with the
@@ -367,6 +640,7 @@ mod tests {
     #[test]
     fn totp_matches_rfc6238_sha1_vectors() {
         let params = TotpParams {
+            hotp_counter: None,
             key: RFC_KEY.to_vec(),
             digits: 8,
             period: 30,
@@ -389,6 +663,7 @@ mod tests {
     #[test]
     fn seconds_remaining_counts_down_within_the_step() {
         let p = TotpParams {
+            hotp_counter: None,
             key: RFC_KEY.to_vec(),
             digits: 6,
             period: 30,
@@ -513,5 +788,99 @@ mod tests {
         assert!(validate_service_name("").is_err());
         assert!(validate_service_name("a:b").is_err());
         assert!(validate_service_name("a b").is_err());
+    }
+
+    #[test]
+    fn hotp_uris_need_a_counter_and_give_rfc4226_codes() {
+        // RFC 4226 key "12345678901234567890" in base32.
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        assert!(parse_otpauth(&format!("otpauth://hotp/x?secret={secret}")).is_err());
+        let p = parse_otpauth(&format!("otpauth://hotp/x?secret={secret}&counter=1")).unwrap();
+        assert_eq!(p.hotp_counter, Some(1));
+        assert_eq!(code_at(&p, 0), "287082");
+        let uri = hotp_uri("my svc", secret, 9);
+        assert_eq!(
+            uri,
+            format!("otpauth://hotp/my%20svc?secret={secret}&counter=9")
+        );
+        assert_eq!(code_at(&resolve_secret(&uri).unwrap(), 0), "520489");
+        let next = set_counter(&uri, 10);
+        assert_eq!(
+            next,
+            format!("otpauth://hotp/my%20svc?secret={secret}&counter=10")
+        );
+        assert_eq!(resolve_secret(&next).unwrap().hotp_counter, Some(10));
+    }
+
+    #[test]
+    fn a_secret_never_shows_in_an_error() {
+        let err = parse_otpauth("otpauth://steam/x?secret=JBSWY3DPEHPK3PXP")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("JBSWY3DP"), "{err}");
+    }
+
+    #[test]
+    fn imports_a_single_otpauth_uri() {
+        let items = import_payload(
+            "otpauth://totp/ACME%20Co:jo@example.com?secret=JBSWY3DPEHPK3PXP&issuer=ACME%20Co\n",
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].issuer, "ACME Co");
+        assert_eq!(items[0].account, "jo@example.com");
+        assert_eq!(suggest_service_name(&items[0]), "acme-co");
+        assert!(import_payload("https://example.com").is_err());
+    }
+
+    #[test]
+    fn imports_a_google_authenticator_export() {
+        // The sample from dim13/otpauth's tests (no base64 padding): one TOTP
+        // account, secret "Hello!\xde\xad\xbe\xef" = JBSWY3DPEHPK3PXP.
+        let uri = "otpauth-migration://offline?data=CjEKCkhlbGxvId6tvu8SGEV4YW1wbGU6YWxpY2VAZ29vZ2xlLmNvbRoHRXhhbXBsZTAC";
+        let items = import_payload(uri).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].issuer, "Example");
+        assert_eq!(items[0].account, "alice@google.com");
+        let p = resolve_secret(&items[0].uri).unwrap();
+        assert_eq!(p.key, b"Hello!\xde\xad\xbe\xef");
+        assert_eq!(p.hotp_counter, None);
+        assert!(items[0].uri.contains("secret=JBSWY3DPEHPK3PXP"));
+        assert_eq!(suggest_service_name(&items[0]), "example");
+    }
+
+    #[test]
+    fn export_with_two_accounts_hotp_and_eight_digits() {
+        // Hand-built payload: field 1 twice. The second is HOTP (type 1),
+        // eight digits (2), SHA256 (2), counter 5.
+        fn ld(field: u8, bytes: &[u8]) -> Vec<u8> {
+            let mut v = vec![(field << 3) | 2, bytes.len() as u8];
+            v.extend_from_slice(bytes);
+            v
+        }
+        let mut a = ld(1, b"abcdefghij");
+        a.extend(ld(2, b"first"));
+        let mut b = ld(1, b"0123456789");
+        b.extend(ld(2, b"bob"));
+        b.extend(ld(3, b"Corp"));
+        b.extend([4 << 3, 2, 5 << 3, 2, 6 << 3, 1, 7 << 3, 5]);
+        let mut payload = ld(1, &a);
+        payload.extend(ld(1, &b));
+        payload.extend([2 << 3, 1]);
+        let data = data_encoding::BASE64
+            .encode(&payload)
+            .replace('+', "%2B")
+            .replace('/', "%2F")
+            .replace('=', "%3D");
+        let items = import_payload(&format!("otpauth-migration://offline?data={data}")).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(suggest_service_name(&items[0]), "first");
+        let p = resolve_secret(&items[1].uri).unwrap();
+        assert_eq!(
+            (p.digits, p.algorithm, p.hotp_counter),
+            (8, Algorithm::Sha256, Some(5))
+        );
+        assert_eq!(items[1].issuer, "Corp");
+        assert!(import_payload("otpauth-migration://offline?data=CgA").is_err());
     }
 }

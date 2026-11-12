@@ -1,10 +1,10 @@
 [package]
 name = "otp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-description = "Generate TOTP one-time passwords from a local secrets file and copy them to the clipboard. Fast Rust CLI."
+description = "Generate TOTP and HOTP one-time passwords from a local secrets file and copy them to the clipboard. Fast Rust CLI."
 authors = ["printemps.tokyo <develop@printemps.tokyo>"]
 repository = "https://github.com/printemps-tokyo/otp"
 homepage = "https://github.com/printemps-tokyo/otp"
@@ -27,9 +27,14 @@ hmac = "0.13"
 sha1 = "0.11"
 sha2 = "0.11"
 data-encoding = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rqrr = { version = "0.11", default-features = false }
 
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[dev-dependencies]
+tempfile = "3"

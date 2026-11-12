@@ -9,8 +9,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use otp::{
-    find_entry, parse_store, resolve_entry, resolve_secret, seconds_remaining, totp_at,
-    validate_service_name, Resolution,
+    code_at, find_entry, hotp_uri, import_payload, parse_store, resolve_entry, resolve_secret,
+    seconds_remaining, set_counter, suggest_service_name, validate_service_name, Resolution,
 };
 
 /// Generate TOTP one-time passwords from a local secrets file.
@@ -44,22 +44,61 @@ struct GenerateArgs {
 enum Command_ {
     /// Add a service. SECRET may be a base32 secret, an otpauth:// URI, or `-`
     /// to read it from stdin (so it stays out of your shell history).
-    Add { service: String, secret: String },
+    Add {
+        service: String,
+        secret: String,
+        /// The secret is for HOTP (counter-based) codes, not TOTP.
+        #[arg(long)]
+        hotp: bool,
+        /// With --hotp: the counter of the next code (default 0).
+        #[arg(long, requires = "hotp")]
+        counter: Option<u64>,
+    },
     /// Remove a service.
     Rm { service: String },
     /// List available services.
-    Ls,
+    Ls {
+        /// Also show each TOTP service's current code and how long it is
+        /// valid (HOTP codes are shown only when asked for, as each one uses
+        /// up a counter value).
+        #[arg(short, long)]
+        codes: bool,
+    },
+    /// Add the accounts in a QR code image (PNG or JPEG): an otpauth:// code
+    /// or a Google Authenticator export, which can hold several accounts.
+    /// `-` reads the QR's text (an otpauth:// or otpauth-migration:// URI)
+    /// from stdin instead.
+    Import {
+        image: PathBuf,
+        /// Service name, for a code with a single account (default: from the
+        /// issuer).
+        #[arg(long)]
+        name: Option<String>,
+        /// Show the services that would be added, and add nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command_::Add { service, secret }) => cmd_add(&service, &secret),
+        Some(Command_::Add {
+            service,
+            secret,
+            hotp,
+            counter,
+        }) => cmd_add(&service, &secret, hotp.then(|| counter.unwrap_or(0))),
         Some(Command_::Rm { service }) => cmd_rm(&service),
-        Some(Command_::Ls) => cmd_list(),
+        Some(Command_::Ls { codes }) => cmd_list(codes),
+        Some(Command_::Import {
+            image,
+            name,
+            dry_run,
+        }) => cmd_import(&image, name.as_deref(), dry_run),
         None => match cli.generate.service.clone() {
             Some(service) => cmd_generate(&service, &cli.generate),
-            None => cmd_list(),
+            None => cmd_list(false),
         },
     }
 }
@@ -85,16 +124,68 @@ fn read_store(path: &PathBuf) -> Result<String> {
     }
 }
 
-/// Write the store with owner-only (0600) permissions.
+/// Write the store through a new owner-only (0600) file renamed over the old
+/// one: the secrets are never readable by others, not even for a moment, and
+/// an interrupted write leaves the old store whole.
 fn write_store(path: &PathBuf, content: &str) -> Result<()> {
-    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut tmp = None;
+    for n in 0..100 {
+        let candidate = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(f) => {
+                tmp = Some((candidate, f));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("failed to write {}", path.display())),
+        }
+    }
+    let (tmp_path, mut f) =
+        tmp.ok_or_else(|| anyhow!("failed to write {}: no free temporary name", path.display()))?;
+    let result = f
+        .write_all(content.as_bytes())
+        .and_then(|_| f.sync_all())
+        .and_then(|_| std::fs::rename(&tmp_path, path));
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| format!("failed to write {}", path.display()));
     }
     Ok(())
+}
+
+/// The store with the value of `service`'s line replaced, everything else
+/// (comments, blank lines, order) kept.
+fn replace_value(raw: &str, service: &str, value: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let t = line.trim();
+        let is_target = !t.is_empty()
+            && !t.starts_with('#')
+            && t.split_once(':').is_some_and(|(s, _)| s.trim() == service);
+        out.push(if is_target {
+            format!("{service}:{value}")
+        } else {
+            line.to_string()
+        });
+    }
+    let mut content = out.join("\n");
+    content.push('\n');
+    content
 }
 
 fn unix_now() -> Result<u64> {
@@ -136,8 +227,18 @@ fn cmd_generate(service: &str, opts: &GenerateArgs) -> Result<()> {
     let params = resolve_secret(&entry.value)
         .with_context(|| format!("invalid secret for service {:?}", entry.service))?;
     let now = unix_now()?;
-    let code = totp_at(&params, now);
-    let remaining = seconds_remaining(&params, now);
+    let code = code_at(&params, now);
+    let validity = match params.hotp_counter {
+        Some(counter) => {
+            // Advance the counter before showing the code, so a code is never
+            // shown twice even if this run is interrupted.
+            let raw = read_store(&path)?;
+            let next = set_counter(&entry.value, counter + 1);
+            write_store(&path, &replace_value(&raw, &entry.service, &next))?;
+            format!("HOTP counter {counter}")
+        }
+        None => format!("valid {}s", seconds_remaining(&params, now)),
+    };
 
     if opts.quiet {
         println!("{code}");
@@ -150,14 +251,14 @@ fn cmd_generate(service: &str, opts: &GenerateArgs) -> Result<()> {
         copy_to_clipboard(&code).is_ok()
     };
     if copied {
-        println!("OTP: {code} (copied to clipboard, valid {remaining}s)");
+        println!("OTP: {code} (copied to clipboard, {validity})");
     } else {
-        println!("OTP: {code} (valid {remaining}s)");
+        println!("OTP: {code} ({validity})");
     }
     Ok(())
 }
 
-fn cmd_add(service: &str, secret_arg: &str) -> Result<()> {
+fn cmd_add(service: &str, secret_arg: &str, hotp_counter: Option<u64>) -> Result<()> {
     validate_service_name(service)?;
 
     let secret = if secret_arg == "-" {
@@ -172,6 +273,13 @@ fn cmd_add(service: &str, secret_arg: &str) -> Result<()> {
     if secret.is_empty() {
         bail!("no secret provided");
     }
+    let secret = match hotp_counter {
+        Some(_) if secret.starts_with("otpauth://") => {
+            bail!("--hotp is for a bare secret; an otpauth:// URI says its own type")
+        }
+        Some(counter) => hotp_uri(service, &secret, counter),
+        None => secret,
+    };
     // Validate up front so we never store something that cannot generate.
     resolve_secret(&secret).context("the provided secret is not valid")?;
 
@@ -221,17 +329,127 @@ fn cmd_rm(service: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list() -> Result<()> {
+fn cmd_list(codes: bool) -> Result<()> {
     let path = secrets_path()?;
     let entries = parse_store(&read_store(&path)?);
     if entries.is_empty() {
         println!("No services yet. Add one with: otp add <service> <secret>");
         return Ok(());
     }
-    println!("Usage: otp <service>");
-    println!("Available services:");
+    if !codes {
+        println!("Usage: otp <service>");
+        println!("Available services:");
+        for entry in &entries {
+            println!("  - {}", entry.service);
+        }
+        return Ok(());
+    }
+    let now = unix_now()?;
+    let width = entries
+        .iter()
+        .map(|e| e.service.chars().count())
+        .max()
+        .unwrap_or(0);
     for entry in &entries {
-        println!("  - {}", entry.service);
+        let shown = match resolve_secret(&entry.value) {
+            Ok(p) if p.hotp_counter.is_some() => {
+                "(HOTP: otp <service> uses the next counter)".to_string()
+            }
+            Ok(p) => format!("{}  {:>2}s", code_at(&p, now), seconds_remaining(&p, now)),
+            Err(_) => "(invalid secret)".to_string(),
+        };
+        println!("{:<width$}  {shown}", entry.service);
+    }
+    Ok(())
+}
+
+/// Read the QR codes in an image and return their text.
+fn decode_qr_image(path: &std::path::Path) -> Result<Vec<String>> {
+    let img = image::open(path)
+        .with_context(|| format!("failed to read {} as a PNG or JPEG image", path.display()))?
+        .to_luma8();
+    let (w, h) = img.dimensions();
+    let mut prepared =
+        rqrr::PreparedImage::prepare_from_greyscale(w as usize, h as usize, |x, y| {
+            img.get_pixel(x as u32, y as u32)[0]
+        });
+    let mut out = Vec::new();
+    for grid in prepared.detect_grids() {
+        match grid.decode() {
+            Ok((_, text)) => out.push(text),
+            Err(e) => eprintln!("otp: a QR code in the image could not be read: {e}"),
+        }
+    }
+    if out.is_empty() {
+        bail!("no readable QR code in {}", path.display());
+    }
+    Ok(out)
+}
+
+fn cmd_import(image: &std::path::Path, name: Option<&str>, dry_run: bool) -> Result<()> {
+    let payloads = if image.as_os_str() == "-" {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read from stdin")?;
+        vec![buf]
+    } else {
+        decode_qr_image(image)?
+    };
+    let mut items = Vec::new();
+    for p in &payloads {
+        items.extend(import_payload(p)?);
+    }
+    if name.is_some() && items.len() != 1 {
+        bail!(
+            "--name needs a code with exactly one account (this one has {})",
+            items.len()
+        );
+    }
+
+    let path = secrets_path()?;
+    let raw = read_store(&path)?;
+    let existing = parse_store(&raw);
+    let mut planned: Vec<(String, String, String)> = Vec::new();
+    for item in &items {
+        let service = name
+            .map(str::to_string)
+            .unwrap_or_else(|| suggest_service_name(item));
+        validate_service_name(&service)?;
+        if find_entry(&existing, &service).is_some()
+            || planned.iter().any(|(s, _, _)| *s == service)
+        {
+            bail!(
+                "service {service:?} already exists or is imported twice; nothing was added (use --name, or otp rm {service})"
+            );
+        }
+        // Check that it generates before anything is stored.
+        resolve_secret(&item.uri)
+            .with_context(|| format!("the account for {service:?} is not usable"))?;
+        let who = match (item.issuer.is_empty(), item.account.is_empty()) {
+            (false, false) => format!("{}, {}", item.issuer, item.account),
+            (false, true) => item.issuer.clone(),
+            _ => item.account.clone(),
+        };
+        planned.push((service, item.uri.clone(), who));
+    }
+
+    if dry_run {
+        for (service, _, who) in &planned {
+            println!("would add {service} ({who})");
+        }
+        return Ok(());
+    }
+    let mut content = raw;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    for (service, uri, _) in &planned {
+        content.push_str(&format!("{service}:{uri}\n"));
+    }
+    write_store(&path, &content)?;
+    for (service, _, who) in &planned {
+        eprintln!("otp: added {service} ({who})");
     }
     Ok(())
 }
